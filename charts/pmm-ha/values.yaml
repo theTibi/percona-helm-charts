@@ -14,7 +14,7 @@ image:
   repository: percona/pmm-server
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "3.9.0"
+  tag: "3.9.1"
   imagePullSecrets: []
 
 ## PMM environment variables
@@ -39,7 +39,8 @@ pmmEnv:
   PMM_HA_GOSSIP_PORT: "9096"
   PMM_HA_RAFT_PORT: "9097"
   PMM_HA_GRAFANA_GOSSIP_PORT: "9094"
-  # PMM_HA_PEERS: "{{ include "pmm.haPeers" . }}"
+  # PMM_HA_PEERS - set in statefulset.yaml
+  # PMM_INTERNAL_NODE_NAME_PREFIXES - set in statefulset.yaml
   GF_ANALYTICS_CHECK_FOR_UPDATES: "0"
   GF_ANALYTICS_ENABLE: "0"
   GF_ANALYTICS_REPORTING_ENABLE: "0"
@@ -50,6 +51,9 @@ pmmEnv:
   PMM_ENABLE_BACKUP_MANAGEMENT: "1"
   PMM_ENABLE_ALERTING: "1"
   PMM_ENABLE_ACCESS_CONTROL: "1"
+  # PMM-15301: QAN on PMM's own PostgreSQL is not supported in HA mode. Pinning it here makes
+  # the "QAN for PMM Server" toggle in Settings reject any attempt to switch it on.
+  PMM_ENABLE_INTERNAL_PG_QAN: "0"
 
 #  optional variables to integrate Grafana with internal iDP, see also secret part
 #  GF_AUTH_GENERIC_OAUTH_ENABLED: "1"
@@ -62,14 +66,49 @@ pmmEnv:
 ## @param pmmResources optional [Resources](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/) 
 ## requested for [PMM container](https://docs.percona.com/percona-monitoring-and-management/3/install-pmm/install-pmm-server/deployment-options/docker/index.html)
 pmmResources:
-  # PMM server resource configuration
+  # PMM server resource configuration.
+  #
+  # Sized for the chart's default profile: ~100 monitored nodes. Only the
+  # HAProxy-elected leader serves traffic (UI, client remote_write, QAN), so the
+  # LIMIT has to cover the whole fleet while the REQUEST is also paid by the two
+  # idle standbys. Keeping the request at roughly half the limit leaves failover
+  # headroom without reserving three times the capacity actually in use.
+  #
+  # For 500- and 1000-node profiles see docs/SIZING.md.
   requests:
-    memory: "3Gi"
-    cpu: "2"
-  limits:
     memory: "4Gi"
     cpu: "2"
+  limits:
+    memory: "8Gi"
+    cpu: "4"
 # pmmResources: {}
+
+## @param dataRetentionDays Optional single retention value, in days, for BOTH metrics and Query Analytics
+##
+## Metrics and Query Analytics are retained by two independent mechanisms, and in
+## an HA deployment neither one knows about the other:
+##
+##   * metrics   - victoriaMetrics.vmstorage.retentionPeriod, enforced by the
+##                 VictoriaMetrics operator on the external vmcluster
+##   * QAN       - PMM's own data retention setting, enforced by qan-api2 against
+##                 ClickHouse, and changeable from the PMM settings page
+##
+## Left EMPTY (the default) the chart does not interfere with either: vmstorage
+## uses victoriaMetrics.vmstorage.retentionPeriod and PMM keeps its own setting.
+## This is the safe choice on upgrade, and it leaves retention adjustable in the
+## PMM UI.
+##
+## Set to a number of days to drive both from here, which is usually what you want
+## when the deployment is managed declaratively. Two consequences to be aware of:
+##
+##   * it takes precedence over victoriaMetrics.vmstorage.retentionPeriod
+##   * it sets PMM_DATA_RETENTION, and PMM refuses to change data retention from
+##     the UI or API while that variable is set
+##
+## Storage scales close to linearly with this value - it is the largest single
+## lever on the cluster's disk footprint. Lowering it deletes data older than the
+## new window on the next reconcile. See docs/SIZING.md before changing it.
+dataRetentionDays: ""
 
 ## Readiness probe Config
 ## ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#configure-probes
@@ -93,6 +132,61 @@ logStreamer:
   logFiles:
     - /srv/logs/pmm-managed.log
     - /srv/logs/qan-api2.log
+
+## @section PMM Client
+## Pre-provisions PMM Client pods to carry the monitoring load that the PMM Server pods should stay
+## free of, such as remote databases, RDS and Azure instances. Each pod registers itself as a Node and can be
+## picked in the "Nodes" dropdown when adding a service.
+## ref: https://docs.percona.com/percona-monitoring-and-management/3/install-pmm/install-pmm-client/index.html
+##
+pmmClient:
+  ## @param pmmClient.replicas Number of PMM Client pods carrying the delegated monitoring
+  ## Defaults to 3 to provide dedicated monitoring Nodes out of the box. You can scale it down if
+  ## one is enough to start with, or scale it up as more monitoring is delegated to them. Setting
+  ## it to 0 creates none, which leaves an HA deployment with no Node to add services to, since the
+  ## PMM Server Nodes are not offered for that.
+  ##
+  replicas: 3
+  ## @param pmmClient.image.repository PMM Client image repository
+  ## @param pmmClient.image.pullPolicy PMM Client image pull policy
+  ## @param pmmClient.image.tag PMM Client image tag, defaults to the chart appVersion
+  ##
+  image:
+    repository: percona/pmm-client
+    pullPolicy: IfNotPresent
+    tag: "3.9.1"
+  ## @param pmmClient.forceRegistration Register the Node even when one with the same name exists
+  ## Recovers a pod whose volume was lost while its Node is still registered in PMM. PMM Server then
+  ## removes that Node with every Service configured on it, so keep this disabled otherwise.
+  ##
+  forceRegistration: false
+  ## @param pmmClient.storage.size Size of the volume holding the Agent identity and metrics buffer
+  ## @param pmmClient.storage.storageClassName Storage class of that volume, cluster default if empty
+  ## The volume backs the canonical pmm-agent directories /usr/local/percona/pmm/config and
+  ## /usr/local/percona/pmm/tmp. The former keeps the pmm-agent configuration, so a restarted pod
+  ## keeps its Node and the Services configured on it; the latter keeps the 1Gi on-disk queue vmagent
+  ## fills while PMM Server is unreachable. Keep the size above that queue.
+  ##
+  storage:
+    size: 2Gi
+    storageClassName: ""
+  ## @param pmmClient.resources Resources requested for the PMM Client container
+  ## An idle Client only runs node_exporter; raise the limits as monitoring is delegated to it.
+  ##
+  resources:
+    requests:
+      memory: 200Mi
+      cpu: 100m
+    limits:
+      memory: 1Gi
+      cpu: 500m
+  ## @param pmmClient.nodeSelector Node labels for the PMM Client pods
+  ## @param pmmClient.tolerations Tolerations for the PMM Client pods
+  ## @param pmmClient.affinity Affinity rules for the PMM Client pods
+  ##
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 ## @section PMM secrets
 ##
@@ -389,11 +483,14 @@ clickhouse:
     tag: 25.3.6.10034.altinitystable-alpine
     pullPolicy: IfNotPresent
   
-  # ClickHouse server resource configuration
+  # ClickHouse server resource configuration.
+  # Holds Query Analytics. Memory is driven by QAN queries and background merges,
+  # not by ingest rate, so the limit is what matters; the CPU request is kept at 1
+  # because steady-state usage is low and three replicas each reserve it.
   resources:
     requests:
       memory: "4Gi"
-      cpu: "2"
+      cpu: "1"
     limits:
       memory: "8Gi"
       cpu: "4"
@@ -408,7 +505,7 @@ clickhouse:
   ## @param clickhouse.datasource.password Password. Generated when empty, and kept across upgrades
   ##
   ## To get the credentials after install:
-  ##   kubectl get secret pmm-ha-clickhouse-datasource -o jsonpath='{.data.PMM_CLICKHOUSE_DATASOURCE_PASSWORD}' | base64 --decode
+  ##   kubectl get secret -n <namespace> pmm-ha-clickhouse-datasource -o jsonpath='{.data.PMM_CLICKHOUSE_DATASOURCE_PASSWORD}' | base64 --decode && echo
   ## The secret is named after the chart fullname, so adjust it if your release name differs.
   ##
   datasource:
@@ -436,14 +533,16 @@ clickhouse:
       repository: clickhouse/clickhouse-keeper
       tag: "25.3.6.56"
       pullPolicy: IfNotPresent
-    # ClickHouse Keeper resource configuration
+    # ClickHouse Keeper resource configuration.
+    # Coordination metadata only - does not scale with the monitored fleet, but a
+    # Keeper that is CPU-starved or OOM-killed stalls every ClickHouse write.
     resources:
       requests:
-        memory: "256Mi"
-        cpu: "100m"
-      limits:
         memory: "512Mi"
-        cpu: "500m"
+        cpu: "250m"
+      limits:
+        memory: "1Gi"
+        cpu: "1"
     # ClickHouse Keeper cluster configuration
     cluster:
       # Keeper cluster name (follows same restrictions as ClickHouse cluster)
@@ -459,10 +558,17 @@ clickhouse:
       # If empty, uses the cluster's default storage class
       storageClassName: ""
   
-  # Persistent storage configuration for ClickHouse data
+  # Persistent storage configuration for ClickHouse data.
+  #
+  # Each of the 3 replicas holds a FULL copy of Query Analytics - this is not
+  # sharded. 50Gi covers ~100 services at the default 30-day retention, with room
+  # for MergeTree merges and ClickHouse's own system.* log tables.
+  #
+  # NOTE: raising this on an existing install triggers a PVC expansion, which
+  # requires a storage class with allowVolumeExpansion: true.
   storage:
     # Size of persistent volume for each ClickHouse pod
-    size: 20Gi
+    size: 50Gi
     # Storage class for ClickHouse persistent volumes
     # If empty, uses the cluster's default storage class
     # storageClassName: ""
@@ -478,6 +584,358 @@ clickhouse:
         - 10.0.0.0/8
         - 172.16.0.0/12
         - 192.168.0.0/16
+  
+  ## @section ClickHouse Backup Configuration (clickhouse-backup sidecar)
+  ## This section configures the clickhouse-backup sidecar container
+  ## clickhouse-backup provides backup/restore functionality via API tables
+  ## Documentation: https://github.com/Altinity/clickhouse-backup
+  ##
+  backup:
+    ## @param clickhouse.backup.enabled Enable clickhouse-backup sidecar container
+    ## When enabled, adds a sidecar container that runs clickhouse-backup in server mode
+    ## Creates system.backup_actions and system.backup_list tables for backup management
+    ## Only takes effect when centralBackupStorage.enabled is true (the backup master switch).
+    enabled: true
+    
+    ## @param clickhouse.backup.image clickhouse-backup image
+    ## Pinned (not :latest) so every CH replica runs the same version — a mixed backup/restore
+    ## version pair can be incompatible. Bump deliberately.
+    image: altinity/clickhouse-backup:2.8.0
+    
+    ## @param clickhouse.backup.resources Resource requests and limits for backup sidecar
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    
+    ## @param clickhouse.backup.retention Number of backups to keep
+    ## Note: Local backups use hardlinks (~0 space) and are copied to central storage
+    keepLocal: 1   # Keep only latest local hardlink backup
+    ## keepRemote MUST stay 0 unless you know what you are trading away.
+    ## 0 disables clickhouse-backup's own remote pruning and leaves the REMOTE copy entirely to
+    ## the orchestrator's retention sweep, which is the only thing that knows about the manifest
+    ## index. clickhouse-backup prunes by COUNT; the orchestrator retains by AGE and keeps a
+    ## manifest per backup id. With both active they disagree: on any schedule finer than daily,
+    ## N remote backups is a far shorter window than --retention days, so clickhouse-backup
+    ## deletes ClickHouse data that unexpired manifests still list as `success`. The pre-restore
+    ## gate catches it (it checks the name against `list remote`), so the failure is loud rather
+    ## than mid-restore — but that backup is no longer fully restorable, silently, from the
+    ## moment the count is exceeded. It also breaks incremental chains the orchestrator is
+    ## deliberately preserving. Set a non-zero value only if you are NOT using the orchestrator
+    ## for ClickHouse, and then align it with your manifest retention and chain depth.
+    keepRemote: 0  # Remote (S3) pruning is owned by the orchestrator's retention sweep
+    
+    ## @param clickhouse.backup.s3 S3 configuration for remote backups
+    ## With existingSecret/accessKey empty, clickhouse-backup uses the IRSA credential
+    ## chain (the CH pod's SA role) — no static keys.
+    s3:
+      enabled: false        # set true + bucket/region per install (do not commit creds/bucket)
+      bucket: ""
+      ## Empty (default) inherits centralBackupStorage.s3.region; set to override for ClickHouse only.
+      region: ""
+      ## Key prefix under the bucket; backups land at s3://<bucket>/<path>/<backup_name>/
+      ## Empty (default) resolves through pmm.backupS3Root to
+      ## "<namespace>/<centralBackupStorage.s3.prefix>/clickhouse" — note the leading
+      ## NAMESPACE segment, which is what keeps two installs that share a bucket (and even a
+      ## prefix) apart. Multi-namespace installs must not share a path: incremental chains and
+      ## retention would cross instances.
+      path: ""
+      endpoint: ""  # Leave empty for AWS S3
+      ## S3 credentials - use existing secret (recommended)
+      ## Create secret: kubectl create secret generic clickhouse-backup-s3 \
+      ##   --from-literal=access-key="AKIAIOSFODNN7EXAMPLE" \
+      ##   --from-literal=secret-key="wJalrXUtnFEMI/K7MDENG..." \
+      ##   -n <namespace>
+      ## Empty (default) falls back to centralBackupStorage.s3.existingSecret, so a single
+      ## shared credential authenticates every component's backup. Set here only to point
+      ## ClickHouse at a different secret.
+      existingSecret: ""
+      existingSecretKeys:          # which keys inside existingSecret hold the credentials
+        accessKey: "access-key"
+        secretKey: "secret-key"
+      ## Or provide credentials directly (not recommended for production)
+      # accessKey: ""
+      # secretKey: ""
+
+## @section Central Backup Storage Configuration
+## This section configures a centralized storage location for all component backups
+## All backups (PostgreSQL, ClickHouse, VictoriaMetrics, encryption keys, logs) are
+## consolidated here for easy management, monitoring, and archival
+##
+centralBackupStorage:
+  ## @param centralBackupStorage.enabled Enable backup infrastructure (backup-tools Deployment,
+  ## sidecars, SA wiring, optional CronJob). Opt-in: with it on you must configure a target
+  ## (s3 bucket+credentials, or a shared RWX volume) — otherwise the backup infra can't run.
+  enabled: false
+
+  ## @param centralBackupStorage.mode Backup target: s3 (object storage, recommended) | shared (RWX/NFS mounted in pods)
+  ##
+  ## SECURITY NOTE for mode=s3: the PMM PostgreSQL encryption key is stored in the SAME bucket
+  ## and under the same prefix as the PostgreSQL dumps it decrypts (encryption/<id>/). A single
+  ## read of the bucket therefore yields both the ciphertext and the key, which defeats column
+  ## encryption in a bucket-compromise or stolen-backup scenario. Mitigate at the bucket:
+  ## enable SSE-KMS with a CMK whose key policy is NOT grantable by the backup role, and keep
+  ## the bucket private with versioning/Object Lock if your RPO allows. See
+  ## docs/pmm-backup-design-notes.md (DN-24).
+  mode: s3
+
+  ## @param centralBackupStorage.sharedMountPath Mount path of the central RWX/NFS volume INSIDE the
+  ## component pods (PMM, vmstorage, ClickHouse) when mode=shared. Each tool writes its backup here
+  ## (vmbackup -dst=fs://, in-pod tar). Must match the orchestrator's --shared-mount-path. The
+  ## backup-tools pod mounts the same volume at centralBackupStorage.mountPath; both resolve to the
+  ## same volume root, so a run lands under <root>/backup_<id>/.
+  sharedMountPath: /central
+
+  ## S3 target (mode=s3): any S3-compatible object storage (AWS S3, MinIO, Ceph RGW, ...).
+  ## Authentication, pick ONE:
+  ##   - static keys (works everywhere): create a Secret with the access/secret key pair
+  ##     and set existingSecret below
+  ##   - IRSA (AWS EKS only, keyless): set irsaRoleArn
+  s3:
+    ## Bucket name (no s3:// prefix). REQUIRED for s3 mode — set per install (do not commit).
+    bucket: ""
+    region: "us-east-1"
+    ## Empty for AWS S3; set for S3-compatible endpoints (e.g. http://minio.minio.svc:9000)
+    endpoint: ""
+    ## rclone S3 provider profile for the PMM sidecar / backup-tools client:
+    ## "AWS" (default), "Minio", "Ceph", or "Other" for anything else S3-compatible.
+    provider: "AWS"
+    ## Key prefix under the bucket. The full root is s3://<bucket>/<namespace>/<prefix>/, with
+    ## every component at <namespace>/<prefix>/<component>/<id>/, the index at
+    ## <namespace>/<prefix>/manifests/<id>.json — the release NAMESPACE is prepended automatically.
+    ##
+    ## Why that matters: retention deletes by AGE under an install's own root and cannot tell
+    ## whose backup an id is, so two installs sharing a root delete each other's backups —
+    ## irreversibly on a bucket without versioning. Because the namespace leads the path, two
+    ## instances in different namespaces of the same cluster are safe even if both leave this
+    ## at the default.
+    ##
+    ## SET A DISTINCT VALUE PER CLUSTER if several CLUSTERS share one bucket: Kubernetes
+    ## namespaces are cluster-scoped, so a `demo` namespace on two clusters would otherwise
+    ## resolve to the same root (e.g. "prod-eu" / "dr-us"). Nothing in the chart can detect
+    ## this for you — cluster identity is not readable through its namespaced RBAC.
+    ##
+    ## A DR/restore target keeps its OWN root here and names the source only at restore time:
+    ##   pmm-backup.sh restore --s3-prefix <source-namespace>/<source-prefix>
+    prefix: "pmm-ha"
+    ## Static credentials for the PMM rclone sidecar (pg_dump//srv/encryption-key/manifest
+    ## uploads) and the restore temp pods. Required on non-AWS S3-compatible storage;
+    ## optional on AWS when IRSA is used instead.
+    existingSecret: ""
+    existingSecretKeys:            # which keys inside existingSecret hold the credentials
+      accessKey: "access-key"
+      secretKey: "secret-key"
+    ## IAM role ARN annotated onto the backup ServiceAccounts (IRSA, AWS EKS only). Set per
+    ## install (e.g. arn:aws:iam::<ACCOUNT_ID>:role/pmm-ha-backup-s3). Empty = no IRSA annotation.
+    ## S3-mode credentials come from ONE of: irsaRoleArn (IRSA), existingSecret (static keys),
+    ## or ambient AWS credentials on the node (instance profile / kube2iam). With none of the
+    ## three, the backup sidecars deploy but every S3 operation fails with auth errors.
+    irsaRoleArn: ""
+    ## Dedicated IRSA-annotated SA used by operator-managed pods (vmstorage, clickhouse, pgbackrest)
+    ## so their backup tools get S3 creds via the credential chain. Must be annotated with irsaRoleArn.
+    ## Empty (default) → release-scoped "<release>-backup-s3" so two releases in one namespace
+    ## don't collide on a single fixed SA. Set to pin a specific name.
+    serviceAccountName: ""
+    ## Extra annotations for the chart-created backup S3 ServiceAccount (created when
+    ## irsaRoleArn is set), e.g. eks.amazonaws.com/sts-regional-endpoints: "false".
+    serviceAccountAnnotations: {}
+
+  ## In-pod S3 client image (PMM backup sidecar / backup-tools). Override registry for mirrors/air-gap.
+  client:
+    image:
+      registry: docker.io
+      repository: rclone/rclone
+      tag: "1.74.3"
+
+  ## backup-tools Deployment image (kubectl + shell; runs the orchestrator scripts and the
+  ## metrics listeners). Pinned tag — do not use :latest.
+  ##
+  ## THE IMAGE MUST PROVIDE kubectl, jq, AND rclone WHEN mode IS s3. This default carries all
+  ## three, so nothing is installed at run time: files/backup-entrypoint.sh probes first and
+  ## skips its `apk add` fallback entirely.
+  ##
+  ## IF YOU OVERRIDE THIS IMAGE, the replacement must carry them too. An image without them
+  ## falls back to `apk add`, which needs ROOT — so on OpenShift, or any cluster whose SCC /
+  ## PodSecurity assigns a non-root UID, the install fails and backup Jobs (which run with
+  ## PMM_TOOLS_STRICT=true) exit non-zero. That is not fixable in the chart; DN-49 records the
+  ## four alternatives measured against shipping a bundled-tools image.
+  ##
+  ## Three things come with this default, and they are not optional:
+  ##   1. TIMESTAMP TAGS ONLY, never :latest. This image bumps kubectl on its own schedule, and
+  ##      kubectl versions have broken this orchestrator before (`kubectl exec
+  ##      --request-timeout` broke in-cluster API discovery in v1.35.x — the reason every call
+  ##      is wrapped in `timeout`).
+  ##   2. Re-run a backup AND a restore whenever you move the tag, for the same reason.
+  ##   3. Give the backup pods a registry pull secret, or mirror the image. Docker Hub rate
+  ##      limits are a real failure mode. Use tools.imagePullSecrets below — NOT
+  ##      image.imagePullSecrets, which also lands on the PMM StatefulSet and would roll every
+  ##      PMM replica just to fix a tools-image pull.
+  ##
+  ## It is a third-party image (Tiger Computing Ltd) and a general-purpose CI toolbox, so it
+  ## also carries aws-cli, helm, ssh and python3 that this chart never uses. Any image with
+  ## kubectl+jq+rclone works; a minimal one you build yourself (Alpine, `apk add jq`, plus
+  ## `COPY --from` for kubectl and rclone) carries far less surface. See docs/pmm-backup.md §9.
+  ##
+  ## TODO(ImageVolume): once the chart's supported floor is Kubernetes >= 1.33 AND OpenShift
+  ## ships ImageVolume (OCP 4.20+), the better answer is to mount the official upstream
+  ## images as read-only OCI volumes instead of depending on any bundled-tools image:
+  ##   volumes:
+  ##     - name: jq-img     # ghcr.io/jqlang/jq       -> /jq
+  ##       image: { reference: "ghcr.io/jqlang/jq:1.8.1" }
+  ##     - name: rclone-img # rclone/rclone           -> /usr/local/bin/rclone
+  ##       image: { reference: "docker.io/rclone/rclone:1.74.3" }
+  ## then add both to PATH. Verified working on Kubernetes 1.36 as an assigned non-root UID:
+  ## official binaries only, read-only mounts nothing in the pod can tamper with, each tool
+  ## pinned independently, and kubectl stays on this chart's own pinned image. Blocked today
+  ## purely by availability — the chart supports 1.22+, ImageVolume is 1.33+, and
+  ## ImageVolumeWithDigest (pinning by digest rather than tag) is still alpha. DN-49 records
+  ## the full comparison so this is not re-derived from scratch.
+  tools:
+    image:
+      registry: docker.io
+      repository: tigercomputing/cloud-tools
+      tag: "20260831175138"
+    ## @param centralBackupStorage.tools.imagePullSecrets Pull secrets for the backup pods only
+    ## Rendered onto the backup ServiceAccount, so it reaches the backup-tools Deployment, every
+    ## backup/restore Job and the s3-mode temp restore pods — without touching
+    ## image.imagePullSecrets, which is chart-wide and would roll the PMM StatefulSet too.
+    ## E.g. imagePullSecrets: [{name: dockerhub}]
+    imagePullSecrets: []
+    ## @param centralBackupStorage.tools.resources Resources for anything running the orchestrator
+    ## Applied to BOTH the always-on backup-tools pod and every backup/restore Job pod — they run
+    ## the same code, so they are sized from one key rather than two blocks that claim to match.
+    ## Raise the memory limit for very large installs (the pg_dump stream is the one payload that
+    ## passes through this process; /srv and ClickHouse tars go pod-to-destination directly).
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+
+  ## @param centralBackupStorage.storageSize Size of central backup storage
+  ## Should be sized for: PostgreSQL + ClickHouse + VictoriaMetrics + logs
+  ## Recommended: 100Gi+ for production
+  storageSize: 100Gi
+  
+  ## @param centralBackupStorage.storageClassName Storage class for central backup PVC
+  ## Empty (default) uses the cluster's default storage class. Set a class that exists on
+  ## your cluster — a non-existent class leaves the PVC Pending and blocks the install.
+  ## shared mode needs an RWX class (NFS/EFS); s3 mode only needs a small RWO logs volume.
+  ## Examples: "gp3", "efs-sc", "nfs-client", etc.
+  storageClassName: ""
+
+  ## @param centralBackupStorage.accessMode Access mode for central backup storage
+  ## Empty (default) picks by mode: ReadWriteMany for shared (many component pods mount the
+  ## volume) and ReadWriteOnce for s3 (only the backup-tools pod mounts a small logs volume).
+  ## Set explicitly to override — e.g. "ReadWriteMany" on NFS/EFS, "ReadWriteOnce" on EBS.
+  ## (Forcing RWX on a cluster whose only storage class is RWO leaves the PVC Pending.)
+  ## In s3 mode an explicit ReadWriteMany also LIFTS the backup Job's required co-location with
+  ## the backup-tools pod: that affinity exists only because an RWO volume can be mounted from a
+  ## single node, so an RWX logs volume (e.g. EFS) lets scheduled runs schedule anywhere.
+  ## With existingClaim (or a pre-bound static PV) this value is the chart's ONLY knowledge of
+  ## the real access mode — it creates no PVC to read it from — so it is treated as your
+  ## DECLARATION about that volume: an RWX claim needs it set to lift the affinity, and setting
+  ## it on a claim that is actually RWO lifts the affinity wrongly and yields Multi-Attach.
+  accessMode: ""
+
+  ## @param centralBackupStorage.existingClaim Name of a PRE-CREATED PVC to consume
+  ## When set, the chart does NOT create a PVC: it only references this one by name, so the
+  ## claim must already exist (standard Helm existingClaim semantics — the chart must not try
+  ## to own a PVC it did not create, which fails on ownership metadata).
+  ## When empty (default), the chart creates and owns <release>-central-backup.
+  ## Example: "pmm-ha-central-backup-efs"
+  existingClaim: ""
+
+  ## @param centralBackupStorage.volumeName Bind the central PVC to a PRE-CREATED static PV
+  ## (sets volumeName + storageClassName:"" to disable dynamic provisioning). Use this to put
+  ## the central volume on a specific EFS/NFS sub-path so PostgreSQL's pgBackRest repo (on a
+  ## sibling sub-path PV) lands in the SAME filesystem tree. Empty = dynamic provisioning.
+  volumeName: ""
+
+  ## @param centralBackupStorage.nfs Mount NFS directly without PVC/PV
+  ## When enabled, existingClaim and PVC creation options are ignored.
+  nfs:
+    enabled: false
+    ## @param centralBackupStorage.nfs.server NFS server IP or hostname
+    server: ""
+    ## @param centralBackupStorage.nfs.path NFS export path
+    path: ""
+  
+  ## @param centralBackupStorage.mountPath Mount path in backup orchestrator pod
+  ## This is where all component backups will be consolidated
+  mountPath: /backups
+  
+  ## NOTE: backup retention is controlled by centralBackupStorage.schedule.retentionDays
+  ## (passed to `pmm-backup.sh backup --retention`). There is no per-component retention here.
+
+  ## @param centralBackupStorage.schedule Scheduled full backups via a Kubernetes CronJob.
+  ## Each run is a JOB that executes pmm-backup.sh itself — there is no exec into the
+  ## backup-tools Deployment and no detached process. The Job pod carries
+  ## karpenter.sh/do-not-disrupt for exactly the run's lifetime, so consolidation cannot
+  ## kill a backup and nothing pins a node once the run ends. In s3 mode the Job
+  ## co-schedules with backup-tools (required podAffinity) to share the RWO logs/metrics
+  ## volume — RWO is node-scoped, so two pods on one node mount it fine; consequence: the
+  ## Job cannot schedule while backup-tools is unschedulable. shared/NFS modes mount from
+  ## any node. Manual full backup, same run:
+  ##   kubectl create job --from=cronjob/<release>-backup manual-$(date +%s) -n <ns>
+  ## Disabled by default — enable once the target (s3/shared) is configured. Restore is
+  ## never scheduled; it stays a deliberate manual action (see examples/restore-job.yaml).
+  schedule:
+    ## @param centralBackupStorage.schedule.enabled Create the backup CronJob
+    enabled: false
+    ## @param centralBackupStorage.schedule.cron Cron expression (cluster timezone)
+    cron: "0 2 * * *"          # daily at 02:00
+    ## @param centralBackupStorage.schedule.retentionDays Prune backups older than N days (--retention)
+    retentionDays: 7
+    ## @param centralBackupStorage.schedule.components Components to back up (empty = all four).
+    ## e.g. ["--postgresql", "--clickhouse"] or add ["--skip-victoriametrics"]
+    components: []
+    ## @param centralBackupStorage.schedule.extraArgs Extra args appended to the backup command
+    extraArgs: []
+    ## @param centralBackupStorage.schedule.startingDeadlineSeconds Skip a run if it can't start within N seconds
+    startingDeadlineSeconds: 600
+    ## @param centralBackupStorage.schedule.terminationGracePeriodSeconds Time a run gets to shut down
+    ## The orchestrator's TERM trap is what releases the per-component Leases and, on a restore,
+    ## deletes the temp mounter pods — all apiserver calls. Kubernetes' 30s default is not enough
+    ## for a multi-component run, and a SIGKILL instead leaves the Leases held for 900s, which
+    ## makes the backoffLimit retry abort immediately. Applies to activeDeadlineSeconds kills and
+    ## to `kubectl delete job`.
+    terminationGracePeriodSeconds: 300
+    ## @param centralBackupStorage.schedule.backoffLimit Retries for a failed run
+    ## A retry RE-RUNS the whole backup (there is no in-flight run to re-attach to), which is
+    ## safe but not free. It only helps when the killed attempt RELEASED ITS LOCKS: a graceful
+    ## TERM, a failed tool install, a preflight refusal. After a SIGKILL (node loss, OOM kill,
+    ## kubectl delete --force) the traps never ran, the component Leases stay held for
+    ## LOCK_LEASE_SECONDS (900s by default) and the retry aborts on them immediately — so the
+    ## schedule, not this counter, is the real retry loop. A run killed by activeDeadlineSeconds
+    ## is not retried at all, whatever this is set to.
+    backoffLimit: 1
+    ## @param centralBackupStorage.schedule.ttlSecondsAfterFinished Delete finished Jobs after N seconds
+    ## Exists for MANUAL `kubectl create job --from=cronjob/<release>-backup` clones, which the
+    ## history limits below never clean. It applies to the CronJob's own Jobs too and is
+    ## INDEPENDENT of failedJobsHistoryLimit: on a sparse schedule (weekly, monthly) a TTL
+    ## shorter than the interval deletes a failed Job — and its pod log, which is the only place
+    ## a failure BEFORE the orchestrator starts is recorded — before anyone looks. Set to null
+    ## on such schedules and let the history limits do the pruning; 0 is a valid Kubernetes
+    ## value meaning "delete as soon as it finishes" and is honoured as such. Default 7 days.
+    ttlSecondsAfterFinished: 604800
+    ## @param centralBackupStorage.schedule.activeDeadlineSeconds Hard cap (seconds) on one scheduled run.
+    ## The run lives INSIDE the Job, so hitting this deadline KILLS the backup itself — the
+    ## interrupted run releases its locks and writes no manifest (restore never sees a
+    ## partial backup), but the time is lost. MUST comfortably exceed the real backup
+    ## duration. Default 6h; raise for very large installs (multi-TB VM data). A run still
+    ## going at the next schedule tick makes that tick skip (concurrencyPolicy: Forbid).
+    activeDeadlineSeconds: 21600
+    ## @param centralBackupStorage.schedule.successfulJobsHistoryLimit Kept succeeded jobs
+    successfulJobsHistoryLimit: 3
+    ## @param centralBackupStorage.schedule.failedJobsHistoryLimit Kept failed jobs
+    failedJobsHistoryLimit: 3
 
 haproxy:
   # Override the HAProxy service name to be fixed (not include release name)
@@ -490,6 +948,22 @@ haproxy:
   enabled: true
   # Number of HAProxy replicas
   replicaCount: 3
+
+  ## @param haproxy.resources Resource requests and limits for the HAProxy container
+  ## Every client remote_write, QAN payload and UI request crosses HAProxy, and it
+  ## terminates TLS for all of them. The upstream subchart ships a request but no
+  ## limit at all, leaving the busiest pod in the ingest path unbounded.
+  ##
+  ## The gap between request and limit is deliberate: PMM clients buffer up to 1GB
+  ## on disk during an outage and replay it on reconnect, so a failover or rolling
+  ## upgrade produces a burst several times steady state.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 128Mi
+    limits:
+      cpu: 1
+      memory: 512Mi
   
   ## HAProxy Service configuration for external access
   ## @param haproxy.service.type Service type for HAProxy
@@ -512,41 +986,47 @@ haproxy:
   # so scaling up/down replicas does NOT require HAProxy restart.
   # Increment config-version only for other ConfigMap changes that require restart.
   podAnnotations:
-    pmm.percona.com/config-version: "3"
+    pmm.percona.com/config-version: "4"
 
-  # Pod anti-affinity for HAProxy pods
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - topologyKey: kubernetes.io/hostname
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: haproxy
-  # Init container to wait for PMM instances to be ready
-  initContainers:
-    - name: wait-for-pmm-ready
-      image: "alpine:latest"
-      command:
-        - /bin/sh
-        - /scripts/wait-for-pmm.sh
-      volumeMounts:
-        - name: init-script
-          mountPath: /scripts
-          readOnly: true
-      resources:
-        requests:
-          cpu: 50m
-          memory: 32Mi
-        limits:
-          cpu: 100m
-          memory: 64Mi
+  # HAProxy pod spread across nodes.
+  #
+  # A required podAntiAffinity on kubernetes.io/hostname caps replicaCount at the
+  # worker-node count: every replica beyond it stays Pending forever while Helm
+  # still reports the release as successful (PMM-15393). A soft topology spread
+  # keeps one pod per node whenever there are enough nodes, and co-locates rather
+  # than failing to schedule when there are not.
+  #
+  # Replicas beyond the worker-node count buy HAProxy throughput, not fault
+  # tolerance - they share a failure domain with an existing replica.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: haproxy
 
-  # Additional volumes for init container
-  extraVolumes:
-    - name: init-script
-      configMap:
-        name: pmm-ha-haproxy-init-script
-        defaultMode: 0755
+  # Serialize voluntary disruptions (node drains, upgrades) now that the soft
+  # topology spread above allows replicas to share a node: draining a node that
+  # hosts two replicas evicts them one at a time, so a replacement is up before
+  # the next eviction.
+  #
+  # maxUnavailable rather than minAvailable: at the default of 3 replicas it keeps
+  # 2 serving, and at replicaCount 1 the node stays drainable. minAvailable: 1
+  # would give allowedDisruptions = 0 there, wedging kubectl drain, the
+  # cluster-autoscaler and managed node-pool upgrades indefinitely. Draining the
+  # sole replica does interrupt traffic briefly - a single replica cannot be both
+  # drainable and always-up, and a stuck drain is the worse failure.
+  PodDisruptionBudget:
+    enable: true
+    maxUnavailable: 1
+
+  # No init container. HAProxy starts immediately and discovers PMM itself:
+  # server-template carries "init-addr last,libc,none", so a backend whose DNS name does
+  # not resolve yet is held with no address rather than aborting startup, and the
+  # /v1/server/leaderHealthCheck check brings it UP only once it is genuinely serving.
+  # Waiting for every replica first turned "HAProxy up, no backends yet" into "no HAProxy
+  # at all" - see PMM-15394.
   # Disable default ConfigMap creation - we create our own
   configMap:
     enabled: false
@@ -599,6 +1079,14 @@ tls:
 ## @param pg-db Configuration values passed to the pg-db dependency chart
 ##
 pg-db:
+  ## Custom annotations the operator propagates to its objects. Not needed for
+  ## pmm-backup.sh (PostgreSQL is backed up with pg_dump). Only set an IRSA
+  ## role-arn here if you enable an OPTIONAL offsite pgBackRest S3 repo (web-id), e.g.:
+  ##   metadata:
+  ##     annotations:
+  ##       eks.amazonaws.com/role-arn: "arn:aws:iam::<ACCOUNT_ID>:role/pmm-ha-backup-s3"
+  metadata:
+    annotations: {}
   autoCreateUserSchema: true
   
   # PostgreSQL user configuration
@@ -633,6 +1121,19 @@ pg-db:
   instances:
     - name: instance1
       replicas: 3
+      ## Without an explicit resources block every PostgreSQL container runs as
+      ## BestEffort, which makes the pods holding PMM's inventory, Grafana state and
+      ## alert rules the first thing the kubelet evicts under node pressure.
+      ##
+      ## PostgreSQL here scales with the number of agents and services, not with
+      ## metric volume, so these stay modest relative to the metrics tier.
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          cpu: 2
+          memory: 4Gi
       dataVolumeClaimSpec:
         # storageClassName: ""  # optional; inherit default if omitted
         accessModes:
@@ -650,6 +1151,15 @@ pg-db:
                   postgres-operator.crunchydata.com/instance-set: instance1
   proxy:
     pgBouncer:
+      ## Connection pooler in front of PostgreSQL - inherits the same BestEffort
+      ## problem as the instances above if left unset.
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -693,11 +1203,169 @@ pg-db:
     ## @param pg-db.pmm.serverHost PMM server hostname (via HAProxy for HA setup)
     ## Uses the fixed "pmm-ha-haproxy" service (HAProxy with fullnameOverride)
     serverHost: pmm-ha-haproxy
+    ## @param pg-db.pmm.postgresParams Extra flags appended to `pmm-admin add postgresql`
+    ## PMM-15301: Query Analytics must stay OFF for PMM's own PostgreSQL cluster - it is an
+    ## internal component, and the "QAN for PMM Server" setting in the UI cannot control it.
+    ## The operator always emits `--query-source=<querySource>`; postgresParams is appended
+    ## last, so repeating the flag here wins. Result: postgres_exporter (metrics) is still
+    ## registered, the QAN agent is not.
+    ## Set to "" to collect query analytics for the bundled PostgreSQL cluster.
+    ## NOTE: requires the pg-db chart >= 3.0.2 - earlier versions silently drop this value.
+    postgresParams: "--query-source=none"
     ## @param pg-db.pmm.resources Resource requests and limits for PMM client sidecar
-    # resources:
-    #   requests:
-    #     memory: 200M
-    #     cpu: 500m
+    ## Runs in every PostgreSQL pod; left unset it is BestEffort like the rest of
+    ## the pod's containers.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  ## @section PostgreSQL Backup Configuration (pgBackRest)
+  ## This section configures pgBackRest backups for PostgreSQL
+  ## pgBackRest is built into the Percona PostgreSQL Operator and provides:
+  ## - Full, Differential, and Incremental backups
+  ## - Point-in-Time Recovery (PITR)
+  ## - Multiple repository support (local, S3, GCS, Azure)
+  ## - Automatic retention management
+  ## - WAL archiving and management
+  ##
+  ## Documentation: https://docs.percona.com/percona-operator-for-postgresql/2.0/backups.html
+  ##
+  backups:
+    ## @param pg-db.backups.enabled Enable pgBackRest backups
+    enabled: true
+    
+    ## @param pg-db.backups.trackLatestRestorableTime Track the latest time to which data can be restored
+    ## Enables real-time monitoring of backup recoverability
+    trackLatestRestorableTime: true
+    
+    pgbackrest:
+      ## @param pg-db.backups.pgbackrest.image pgBackRest image
+      image: docker.io/percona/percona-pgbackrest:2.56.0-1
+      
+      ## @param pg-db.backups.pgbackrest.manual Manual backup configuration
+      ## Used when triggering on-demand backups via pmm-backup.sh or kubectl
+      manual:
+        ## @param pg-db.backups.pgbackrest.manual.repoName Default repository for manual backups
+        repoName: repo1
+        ## @param pg-db.backups.pgbackrest.manual.options Additional pgBackRest options for manual backups
+        ## Example options:
+        ## - --type=full                    # Force full backup
+        ## - --type=incr                    # Incremental backup (default)
+        ## - --type=diff                    # Differential backup
+        ## - --repo1-retention-full=7       # Keep 7 full backups
+        ## - --repo1-retention-diff=3       # Keep 3 differential backups
+        ## - --repo1-retention-archive=7    # Keep 7 sets of WAL archives
+        options:
+        - --type=full                    # Full backup for manual runs (e.g. pmm-backup.sh)
+        - --repo1-retention-full=1      # Keep 1 full on repo-host so full-folder copy to central is minimal
+        - --repo1-retention-diff=1
+        - --repo1-retention-archive=1
+      
+      ## @param pg-db.backups.pgbackrest.repos Backup repositories configuration
+      ## You can configure multiple repositories for different backup strategies:
+      ## - repo1: Local storage (fast recovery)
+      ## - repo2: S3 storage (offsite backup)
+      ## - repo3: GCS storage (geographic redundancy)
+      ## - repo4: Azure storage
+      ##
+      ## IMPORTANT: Scheduled backups are DISABLED by default.
+      ## Backups must be triggered manually using pmm-backup.sh or kubectl.
+      ## To enable scheduled backups, uncomment the 'schedules:' section below.
+      repos:
+      ## Repository 1: Local storage (required, used for WAL archiving)
+      - name: repo1
+        ## @param pg-db.backups.pgbackrest.repos[0].schedules Backup schedules in cron format
+        ## Scheduled backups are DISABLED - uncomment to enable automatic backups
+        # schedules:
+        #   ## Full backup schedule (recommended: weekly)
+        #   full: "0 2 * * 0"  # Sunday at 2 AM UTC
+        #   ## Differential backup schedule (optional, recommended: mid-week)
+        #   # differential: "0 2 * * 3"  # Wednesday at 2 AM UTC
+        #   ## Incremental backup schedule (optional, recommended: frequent)
+        #   # incremental: "0 */6 * * *"  # Every 6 hours
+        ## @param pg-db.backups.pgbackrest.repos[0].volume Local storage configuration
+        ## Storage is persistent - PVC will not be deleted when chart is uninstalled
+        volume:
+          volumeClaimSpec:
+            ## @param pg-db.backups.pgbackrest.repos[0].volume.volumeClaimSpec.storageClassName Storage class for backup PVC
+            ## Leave empty to use cluster default storage class
+            ## For production, use a storage class that supports volume expansion
+            # storageClassName: "gp3"
+            accessModes:
+            - ReadWriteOnce
+            resources:
+              requests:
+                ## @param pg-db.backups.pgbackrest.repos[0].volume.volumeClaimSpec.resources.requests.storage Backup storage size
+                ## repo1 is LOCAL-only: WAL archive + one retained full for replica bootstrap/HA
+                ## (retention is capped at 1 full via manual.options below). The actual off-cluster
+                ## backups are logical pg_dumps taken by pmm-backup.sh, NOT pgBackRest, so
+                ## repo1 stays small. 1Gi matches the operator default — raising it forces a PVC
+                ## expansion on upgrade (fails on storage classes without allowVolumeExpansion).
+                ## Storage persists even after helm uninstall.
+                storage: 1Gi
+      
+      ## NOTE: pmm-backup.sh backs up PostgreSQL with pg_dump (logical), it does
+      ## NOT use a pgBackRest offsite repo. repo1 (local) is required by the operator for
+      ## replica bootstrap / HA. repo2/3/4 below are OPTIONAL offsite pgBackRest repos you
+      ## can enable independently; the orchestrator neither needs nor uses them.
+      ##
+      ## Repository 2: S3 (optional offsite). Uncomment + configure to enable.
+      # - name: repo2
+      #   s3:
+      #     bucket: "my-pg-backups"
+      #     endpoint: ""            # empty = AWS; or s3.<region>.amazonaws.com
+      #     region: "us-east-1"
+
+      ## Repository 3: Google Cloud Storage (optional)
+      ## Uncomment and configure to enable GCS backups
+      # - name: repo3
+      #   gcs:
+      #     ## GCS bucket name (required)
+      #     bucket: "pmm-postgresql-backups-gcs"
+      #   schedules:
+      #     ## Weekly full backup to GCS
+      #     full: "0 4 * * 0"  # Sunday at 4 AM UTC
+      
+      ## Repository 4: Azure Blob Storage (optional)
+      ## Uncomment and configure to enable Azure backups
+      # - name: repo4
+      #   azure:
+      #     ## Azure container name (required)
+      #     container: "pmm-postgresql-backups"
+      #   schedules:
+      #     ## Weekly full backup to Azure
+      #     full: "0 5 * * 0"  # Sunday at 5 AM UTC
+
+      ## pgBackRest global options — only needed for optional offsite repos you enable above
+      ## (e.g. repo2-s3-key-type: web-id). pmm-backup.sh uses pg_dump, so it needs none.
+      global: {}
+    
+    ## @section S3 Credentials Configuration
+    ## If using S3 (repo2), you need to provide credentials
+    ## Create a secret with your S3 credentials:
+    ##
+    ## kubectl create secret generic pg-db-backrest-repo-config \
+    ##   --from-literal=aws-s3-key="AKIAIOSFODNN7EXAMPLE" \
+    ##   --from-literal=aws-s3-key-secret="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
+    ##   -n demo
+    ##
+    ## Or use existing secret name:
+    # s3SecretName: "pg-db-backrest-repo-config"
+    
+    ## @section GCS Credentials Configuration
+    ## If using GCS (repo3), you need to provide service account key
+    ## Create a secret with your GCS service account JSON key:
+    ##
+    ## kubectl create secret generic pg-db-gcs-key \
+    ##   --from-file=gcs-key=/path/to/service-account-key.json \
+    ##   -n demo
+    ##
+    ## Or use existing secret name:
+    # gcsSecretName: "pg-db-gcs-key"
 
 ## @section Kubernetes cluster metrics (kube-state-metrics + node-exporter)
 ## Installs kube-state-metrics and node-exporter by default and lets the
@@ -706,9 +1374,26 @@ pg-db:
 ## ref: https://github.com/prometheus/node_exporter
 kube-state-metrics:
   enabled: true
+  ## Memory scales with the number of objects in the Kubernetes cluster, not with
+  ## the monitored database fleet. Left unset the subchart runs it as BestEffort.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 prometheus-node-exporter:
   enabled: true
+  ## Runs on every node in the cluster, so keep the request small.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
 
 ## @section Node exporter source
 ## Bundled DaemonSet vs OpenShift's platform node-exporter.
@@ -726,7 +1411,7 @@ nodeExporter:
 ## before installing this chart. This section configures the VictoriaMetrics resources (not the operator itself).
 ## 
 ## Installation order:
-##   1. helm install pmm-operators charts/pmm-ha-dependencies -n <namespace>
+##   1. helm install pmm-ha-operators charts/pmm-ha-dependencies -n <namespace>
 ##   2. helm install pmm charts/pmm-ha -n <namespace>
 ## 
 ## This configuration uses VictoriaMetrics Operator CRDs (VMCluster, VMAuth, VMAgent, VMStorage)
@@ -743,13 +1428,16 @@ victoriaMetrics:
     ## @param victoriaMetrics.vmselect.replicaCount Number of vmselect replicas
     replicaCount: 2
     ## @param victoriaMetrics.vmselect.resources Resource requests and limits for vmselect
+    ## Memory is driven by query fan-out (series touched per query), not by ingest.
+    ## A single wide dashboard query over a large fleet is the usual cause of an
+    ## vmselect OOM, which is why the limit sits well above the request.
     resources:
       requests:
-        memory: "512Mi"
-        cpu: "200m"
+        memory: "1Gi"
+        cpu: "500m"
       limits:
-        memory: "2Gi"
-        cpu: "1"
+        memory: "4Gi"
+        cpu: "2"
     ## @param victoriaMetrics.vmselect.affinity Pod affinity configuration for vmselect
     affinity:
       podAntiAffinity:
@@ -847,13 +1535,16 @@ victoriaMetrics:
     ## @param victoriaMetrics.vmagent.replicaCount Number of vmagent replicas
     replicaCount: 2
     ## @param victoriaMetrics.vmagent.resources Resource requests and limits for vmagent
+    ## This vmagent scrapes only the chart's own infrastructure (HAProxy, ClickHouse,
+    ## the VM components, kubelet/cAdvisor/apiserver). It therefore scales with the
+    ## size of the Kubernetes cluster, NOT with the number of monitored nodes.
     resources:
       requests:
-        memory: "256Mi"
-        cpu: "100m"
+        memory: "512Mi"
+        cpu: "250m"
       limits:
         memory: "1Gi"
-        cpu: "500m"
+        cpu: "1"
     ## @param victoriaMetrics.vmagent.affinity Pod affinity configuration for vmagent
     affinity:
       podAntiAffinity:
@@ -882,21 +1573,40 @@ victoriaMetrics:
   vmstorage:
     ## @param victoriaMetrics.vmstorage.replicaCount Number of vmstorage replicas
     replicaCount: 3
-    ## @param victoriaMetrics.vmstorage.retentionPeriod Data retention period
+    ## @param victoriaMetrics.vmstorage.retentionPeriod Data retention period for metrics
+    ## Applies to metrics only. Query Analytics is retained separately by PMM's own
+    ## setting, so the two can differ - set the chart-wide dataRetentionDays instead
+    ## if you want one value to drive both.
+    ##
+    ## Note that the storage needed grows linearly with this: 90d of metrics needs
+    ## roughly three times the vmstorage PVC that storageSize below defaults to.
+    ## See docs/SIZING.md.
     retentionPeriod: "90d"
     ## @param victoriaMetrics.vmstorage.resources Resource requests and limits for vmstorage
+    ## Memory tracks ACTIVE SERIES, not ingest rate. VictoriaMetrics sizes its caches
+    ## from the cgroup limit, so a very wide request/limit gap invites node
+    ## overcommit followed by an OOM kill - keep the two within ~2x of each other.
     resources:
       requests:
-        memory: "1Gi"
+        memory: "2Gi"
         cpu: "500m"
       limits:
         memory: "4Gi"
         cpu: "2"
     ## @param victoriaMetrics.vmstorage.storageSize Size of persistent volume for each vmstorage pod
+    ## 50Gi per pod covers ~100 monitored nodes at the default 30-day retention with
+    ## replicationFactor 2 across 3 pods. Metrics storage scales linearly with both
+    ## node count and retention - see docs/SIZING.md for the formula.
     storageSize: 50Gi
     ## @param victoriaMetrics.vmstorage.storageClassName Storage class for VictoriaMetrics persistent volumes
     ## If empty, uses the cluster's default storage class
     storageClassName: ""
+    
+    ## @param victoriaMetrics.vmstorage.backupVolumeSize Size limit for local backup volume (emptyDir)
+    ## Note: Local backups use emptyDir (ephemeral storage on the node)
+    ## For persistent backups, configure S3 below
+    backupVolumeSize: 20Gi
+    
     ## @param victoriaMetrics.vmstorage.affinity Pod affinity configuration for vmstorage
     affinity:
       podAntiAffinity:
@@ -915,3 +1625,47 @@ victoriaMetrics:
     podAnnotations: {}
     ## @param victoriaMetrics.vmstorage.extraArgs Extra arguments for vmstorage
     extraArgs: {}
+    
+    ## @section VictoriaMetrics Backup Configuration (vmbackup sidecar)
+    ## vmbackup provides backup/restore functionality for vmstorage
+    ## Documentation: https://docs.victoriametrics.com/vmbackup/
+    ##
+    backup:
+      ## @param victoriaMetrics.vmstorage.backup.enabled Enable vmbackup sidecar container
+      ## Only takes effect when centralBackupStorage.enabled is true (the backup master switch).
+      enabled: true
+      
+      ## @param victoriaMetrics.vmstorage.backup.image vmbackup image
+      ## Pinned (not :latest) for reproducibility; keep in step with the vmstorage version.
+      image: victoriametrics/vmbackup:v1.149.0
+
+      ## @param victoriaMetrics.vmstorage.backup.restoreImage vmrestore image (for restore from central backup)
+      ## Keep the same version as backup.image.
+      restoreImage: victoriametrics/vmrestore:v1.149.0
+      
+      ## @param victoriaMetrics.vmstorage.backup.resources Resource requests and limits for vmbackup sidecar
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      
+      ## @param victoriaMetrics.vmstorage.backup.s3 S3 configuration for remote backups
+      s3:
+        ## Enables the vmbackup sidecar's AWS env (AWS_REGION). With existingSecret empty,
+        ## vmbackup uses the IRSA credential chain (no static keys). The bucket/key come
+        ## from the -dst the orchestrator passes, not from here. In s3 mode this env is
+        ## wired automatically (see vmcluster.yaml); set true only to force it independently.
+        enabled: false
+        ## Empty (default) inherits centralBackupStorage.s3.region; set to override for VM only.
+        region: ""
+        endpoint: ""  # Leave empty for AWS S3
+        ## S3 credentials - leave empty to use IRSA (the vmstorage SA's role), or to fall back
+        ## to centralBackupStorage.s3.existingSecret (static keys) if that is set. Set here
+        ## only to point vmbackup at a different secret.
+        existingSecret: ""
+        existingSecretKeys:      # which keys inside existingSecret hold the credentials
+          accessKey: "access-key"
+          secretKey: "secret-key"

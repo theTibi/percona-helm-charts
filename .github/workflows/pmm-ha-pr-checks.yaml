@@ -5,13 +5,75 @@ on:
       - 'charts/pmm-ha/**'
       - 'charts/pmm-ha-dependencies/**'
 
+# Least privilege for GITHUB_TOKEN. Both jobs below execute files that come FROM the pull
+# request (the chart's shell suites, ct's chart hooks), and nothing here writes to the repo, so
+# read access to contents is all the token needs. Without this block the workflow inherits the
+# repository default, which may be read-write.
+permissions:
+  contents: read
+
 jobs:
+  # The orchestrator's own suites. A separate job on purpose: they need no cluster, no helm and
+  # no repositories, so they finish in seconds and give an independent signal — and they are the
+  # only thing that can catch the class of bug files/pmm-backup.sh keeps citing in its comments
+  # (a `set -u` read of a variable a refactor deleted, a dash-only expansion, a helper whose
+  # non-zero return aborts the run between the upload and the manifest write). Nothing gated on
+  # them before, so those regressions could ship a third time.
+  backup-script-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Do not leave the token in .git/config: the steps after this one run code that
+          # came from the pull request.
+          persist-credentials: false
+          sparse-checkout: |
+            charts/pmm-ha
+
+      - name: Install the shells the orchestrator claims to support
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dash busybox-static
+
+      - name: Shell syntax (all three shells)
+        run: |
+          set -eu
+          # BOTH shipped scripts. pmm-backup.sh is the orchestrator; backup-entrypoint.sh is the
+          # `command:` of every backup and restore Job pod AND the backup-tools Deployment's
+          # start-up installer, so a syntax error or a busybox-ash-ism in either one fails every
+          # run at container start, before anything is logged.
+          for f in charts/pmm-ha/files/pmm-backup.sh charts/pmm-ha/files/backup-entrypoint.sh; do
+            for sh_bin in /bin/sh /bin/dash /bin/bash; do
+              echo "== ${sh_bin} -n ${f} =="
+              "${sh_bin}" -n "${f}"
+            done
+            echo "== busybox sh -n ${f} =="
+            busybox sh -n "${f}"
+          done
+
+      - name: Static checks (tests/pmm-backup-lint.sh)
+        run: sh charts/pmm-ha/tests/pmm-backup-lint.sh
+
+      - name: Unit tests, under every supported shell
+        run: |
+          set -eu
+          for sh_bin in dash bash; do
+            echo "===== ${sh_bin} ====="
+            "${sh_bin}" charts/pmm-ha/tests/pmm-backup-unit.sh
+          done
+          echo "===== busybox ash ====="
+          busybox sh charts/pmm-ha/tests/pmm-backup-unit.sh
+
   lint-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # Do not leave the token in .git/config: the steps after this one run code that
+          # came from the pull request.
+          persist-credentials: false
           fetch-depth: 0
           sparse-checkout: |
             .github/
@@ -111,6 +173,54 @@ jobs:
             PMM_CLICKHOUSE_USER: Y2h1c2Vy
             PMM_CLICKHOUSE_PASSWORD: Y2hwYXNz
           EOF
+
+      # Guards the release-name-sensitive names: `pmm.fullname` equals `Release.Name` only
+      # when the release name already contains the chart name, so a release like `pmm-2`
+      # (fullname `pmm-2-pmm-ha`) is the case that regresses. `ct install` generates a
+      # `pmm-ha`-prefixed release name, so the normal install cannot catch this.
+      # Needs the cluster: templates/pg-user-credentials-secrets.yaml does an unconditional
+      # `lookup` + `fail` on pmm-secret, so an offline `helm template` cannot render the chart.
+      - name: Check release-name-sensitive names render correctly
+        if: steps.list-changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          NS="${{ env.NS }}"
+          out=$(helm template pmm-2 charts/pmm-ha --namespace "$NS" --dry-run=server)
+
+          assert_has() {  # $1 = expected substring, $2 = what it guards
+            if ! grep -qF -- "$1" <<<"$out"; then
+              echo "::error::missing from render ($2): $1"
+              exit 1
+            fi
+          }
+          assert_lacks() {
+            if grep -qF -- "$1" <<<"$out"; then
+              echo "::error::render regressed ($2): found $1"
+              exit 1
+            fi
+          }
+
+          # The HA peer list must use the StatefulSet name, not Release.Name.
+          # HAProxy has no per-pod names to check: it discovers backends through the
+          # headless service via server-template, with no init script (PMM-15394).
+          assert_has "value: \"pmm-2-pmm-ha-0.monitoring-service.${NS}.svc.cluster.local" "PMM_HA_PEERS"
+          assert_lacks "pmm-2-0.monitoring-service" "PMM_HA_PEERS uses Release.Name"
+
+          # ClickHouse/Keeper scrape jobs match the chi/chk pod label, which carries Release.Name.
+          assert_has "regex: 'pmm-2'" "clickhouse scrape job selector"
+          assert_has "regex: 'pmm-2-keeper'" "keeper scrape job selector"
+
+          # ...and that is only correct while the CRs are still named from Release.Name.
+          chi=$(helm template pmm-2 charts/pmm-ha --namespace "$NS" --dry-run=server \
+                  -s templates/clickhouse-cluster.yaml | grep -m1 '^  name:')
+          [[ "$chi" == "  name: pmm-2" ]] || { echo "::error::CHI name changed: $chi"; exit 1; }
+
+          # Release names are not regex-safe: a dot in the name must not widen an anchored regex.
+          helm template 'pmm.ha' charts/pmm-ha --namespace "$NS" --dry-run=server \
+            | grep -qF "regex: 'pmm\\.ha'" \
+            || { echo "::error::Release.Name is not regex-escaped in vmagent scrape configs"; exit 1; }
+
+          echo "Release-name-sensitive names render correctly."
 
       - name: Install pmm-ha-dependencies chart
         if: steps.list-changed.outputs.changed == 'true'
